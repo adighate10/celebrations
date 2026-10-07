@@ -1,0 +1,199 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Celebrations: one small server running the Go binary, with CloudFront in front for HTTPS.
+  The server keeps live connections open and its data in memory, so there is exactly one of it.
+
+Parameters:
+  Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Amazon Linux 2023 (Arm). Resolved to the latest image when the server is created.
+  CloudFrontPrefixList:
+    Type: String
+    Description: >-
+      ID of the managed prefix list com.amazonaws.global.cloudfront.origin-facing in this Region
+      (deploy.sh looks it up). Only CloudFront may reach the server.
+  AppPort:
+    Type: Number
+    Default: 8080
+
+Resources:
+  # Holds the built binary; the server pulls it from here on first boot and on every update.
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub celebrations-app-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # lets us run commands on the server through Systems Manager, so it needs no SSH
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: read-binary
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${ArtifactBucket.Arn}/*
+        # optional settings such as the Gemini API key, stored by you as /celebrations/...
+        - PolicyName: read-settings
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/celebrations/*
+
+  ServerProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ServerRole
+
+  ServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Celebrations server - app port open to CloudFront only
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref AppPort
+          ToPort: !Ref AppPort
+          SourcePrefixListId: !Ref CloudFrontPrefixList
+          Description: CloudFront origin-facing addresses
+
+  Server:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref Ami
+      InstanceType: t4g.micro
+      IamInstanceProfile: !Ref ServerProfile
+      SecurityGroupIds:
+        - !GetAtt ServerSecurityGroup.GroupId
+      MetadataOptions:
+        HttpTokens: required
+      CreditSpecification:
+        CPUCredits: standard   # throttle rather than bill extra if the CPU is ever pinned
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: celebrations
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          useradd --system --home /var/lib/celebrations --create-home --shell /sbin/nologin celebrations
+          install -d /opt/celebrations
+
+          # Pulls the current binary and restarts the app. deploy.sh runs this on every update.
+          cat >/usr/local/bin/celebrations-update <<'EOF'
+          #!/bin/bash
+          set -euo pipefail
+          aws s3 cp s3://${ArtifactBucket}/celebrations /opt/celebrations/celebrations.new --region ${AWS::Region}
+          chmod 755 /opt/celebrations/celebrations.new
+          mv /opt/celebrations/celebrations.new /opt/celebrations/celebrations
+          systemctl restart celebrations
+          EOF
+          chmod 755 /usr/local/bin/celebrations-update
+
+          cat >/etc/systemd/system/celebrations.service <<'EOF'
+          [Unit]
+          Description=Celebrations
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          User=celebrations
+          WorkingDirectory=/var/lib/celebrations
+          ExecStart=/opt/celebrations/celebrations -addr :${AppPort} -data /var/lib/celebrations/stages.json
+          Restart=always
+          RestartSec=2
+          NoNewPrivileges=true
+          ProtectSystem=strict
+          ProtectHome=true
+          PrivateTmp=true
+          ReadWritePaths=/var/lib/celebrations
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable celebrations
+
+          # On the very first deploy the binary is uploaded while this stack is still being created.
+          for attempt in $(seq 1 80); do
+            /usr/local/bin/celebrations-update && break
+            sleep 15
+          done
+
+  # A fixed address, so the server keeps the same name for CloudFront across stops and starts.
+  ServerAddress:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  ServerAddressAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ServerAddress.AllocationId
+      InstanceId: !Ref Server
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: ServerAddressAssociation
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Celebrations
+        HttpVersion: http2and3
+        Origins:
+          - Id: server
+            # CloudFront needs a host name, not an IP: this is the public DNS name of the fixed address
+            DomainName: !Sub
+              - ec2-${Dashed}.${AWS::Region}.compute.amazonaws.com
+              - Dashed: !Join ['-', !Split ['.', !GetAtt ServerAddress.PublicIp]]
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPPort: !Ref AppPort
+              # the live feed sends a ping every 25s; stay comfortably above that
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: server
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad          # managed: CachingDisabled
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3  # managed: AllViewer
+
+Outputs:
+  Url:
+    Description: Public address of Celebrations
+    Value: !Sub https://${Distribution.DomainName}
+  ServerId:
+    Value: !Ref Server
+  Bucket:
+    Value: !Ref ArtifactBucket

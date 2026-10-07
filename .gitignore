@@ -1,0 +1,25 @@
+# Secrets and local settings (.env.example is the template to copy)
+.env
+.env.*
+!.env.example
+
+# App data: stages, audience tokens and host keys
+stages.json
+dev-data.json
+*.tmp
+
+# Build output
+/celebrations
+/deploy/build/
+*.test
+*.out
+
+# Editor, OS and tool clutter
+.DS_Store
+*.swp
+.idea/
+.vscode/
+.claude/
+
+#claude
+CLAUDE.md
